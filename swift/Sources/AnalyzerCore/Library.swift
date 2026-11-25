@@ -3,7 +3,8 @@ import Foundation
 
 func isAudio(_ u: URL) -> Bool { AUDIO_EXTS.contains(u.pathExtension.lowercased()) && !u.lastPathComponent.hasPrefix(".") }
 
-/// Audio files under the given folders/files, sorted by path.
+/// Audio files under the given folders/files, sorted by path. A file reached through several inputs
+/// (a folder and a folder inside it, or a file inside a given folder) is listed once.
 public func audioFiles(_ urls: [URL]) -> [URL] {
     var out: [URL] = []
     for u in urls {
@@ -14,7 +15,8 @@ public func audioFiles(_ urls: [URL]) -> [URL] {
             out.append(u)
         }
     }
-    return out.sorted { $0.path < $1.path }
+    var seen = Set<String>()
+    return out.filter { seen.insert($0.path).inserted }.sorted { $0.path < $1.path }
 }
 
 /// Track files listed in a Rekordbox XML export (.xml) or an M3U/M3U8 playlist.

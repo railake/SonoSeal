@@ -159,6 +159,19 @@ func pythonParity() throws {
     #expect(line.hasPrefix("\"/a,b.flac\",OK,0,") && line.hasSuffix("\"say \"\"hi\"\"\""))
 }
 
+@Test func audioFilesListsEachTrackOnce() throws {
+    // real path: the enumerator reports /var/folders/… as /private/var/folders/…
+    let tmp = try FileManager.default.temporaryDirectory.resourceValues(forKeys: [.canonicalPathKey]).canonicalPath!
+    let dir = URL(fileURLWithPath: tmp).appending(path: "mla-af-\(UUID())")
+    let sub = dir.appending(path: "A")
+    try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    for f in [dir.appending(path: "x.flac"), sub.appending(path: "y.mp3")] { try Data([1]).write(to: f) }
+    // a folder, the folder holding it, and a file inside both: each track listed once
+    let got = audioFiles([sub, dir, sub.appending(path: "y.mp3")]).map(\.path)
+    #expect(got == [sub.appending(path: "y.mp3").path, dir.appending(path: "x.flac").path])
+}
+
 @Test func sortAndFilter20k() {
     var rs = (0 ..< 20000).map { i in
         var r = TrackResult(path: "/m/Artist \(i % 200)/\(i % 2 == 0 ? "b" : "B") track \(19999 - i).flac", verdict: "OK", reason: "")

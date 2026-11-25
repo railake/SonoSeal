@@ -61,6 +61,7 @@ enum SortChoice: String, CaseIterable, Identifiable {
     var total = 0
     var done = 0
     var started = Date.now
+    @ObservationIgnored private var doneBefore = 0  // tracks already listed when the scan started (adding a folder)
     var counts: [String: Int] = [:]
     var folders: [(path: String, name: String, fake: Int, total: Int)] = []  // one per opened folder
     var showInspector = true
@@ -89,7 +90,7 @@ enum SortChoice: String, CaseIterable, Identifiable {
         let d = UserDefaults.standard
         let paths = d.stringArray(forKey: "folders") ?? d.string(forKey: "root").map { [$0] } ?? []  // "root": pre-multi-folder key
         let urls = paths.filter { FileManager.default.fileExists(atPath: $0) }.map { URL(fileURLWithPath: $0) }
-        if !urls.isEmpty { open(urls) }
+        if !urls.isEmpty { open(outermost(urls)) }  // older versions could save a folder and one inside it
     }
 
     var selected: TrackResult? { selection.count == 1 ? results.first { $0.path == selection.first } : nil }
@@ -102,17 +103,47 @@ enum SortChoice: String, CaseIterable, Identifiable {
         p.directoryURL = root ?? URL.musicDirectory
         p.message = "Choose one or more music folders"
         guard p.runModal() == .OK else { return }
-        // add to the open folders; skip any already covered by one (avoids scanning tracks twice)
-        var all = sources.filter(isDir)
-        for u in p.urls where !all.contains(where: { u.path == $0.path || u.path.hasPrefix($0.path + "/") }) { all.append(u) }
-        open(all)
+        addFolders(p.urls)
     }
 
-    func removeFolder(_ path: String) { open(sources.filter { isDir($0) && $0.path != path }) }
+    /// Adds folders to the library and scans only them; tracks already listed stay as they are.
+    /// A folder inside an open one is skipped; open folders inside a new one fold into it (no track listed twice).
+    func addFolders(_ dirs: [URL]) {
+        let new = outermost(dirs).filter { u in !sources.contains { covers($0, u.path) } }
+        guard !new.isEmpty else { return }
+        let all = sources.filter { s in !new.contains { covers($0, s.path) } } + new
+        root = all.count == 1 && isDir(all[0]) ? all[0] : nil
+        if scanning { scan(all); return }  // the running scan's file list is fixed; restart it with the new folders
+        sources = all
+        if let f = folder, !f.isEmpty, !all.contains(where: { $0.path == f }) { folder = "" }  // e.g. folded into a new one
+        refreshCounts()
+        run(new)
+    }
+
+    /// Drops one opened folder and its tracks; everything else stays as scanned (no rescan).
+    func removeFolder(_ path: String) {
+        let rest = sources.filter { $0.path != path }
+        guard !rest.isEmpty else { open([]); return }
+        root = rest.count == 1 && isDir(rest[0]) ? rest[0] : nil
+        if scanning { scan(rest); return }  // the running scan already listed this folder's files; restart without them
+        // tracks under the folder, unless another opened source still covers them
+        let gone = Set(results.lazy.map(\.path).filter { p in p.hasPrefix(path + "/") && !rest.contains(where: { covers($0, p) }) })
+        sources = rest
+        results.removeAll { gone.contains($0.path) }
+        selection.subtract(gone)
+        for p in gone { searchKeys[p] = nil }
+        total = results.count  // (a stopped scan's total also counted files it never reached)
+        if folder == path { folder = "" }
+        refreshCounts(); resort(); fitRanges()
+    }
 
     private func open(_ dirs: [URL]) {
         root = dirs.count == 1 ? dirs[0] : nil
-        if dirs.isEmpty { stop(); sources = []; results = []; selection = []; refreshCounts(); resort() } else { scan(dirs) }
+        guard dirs.isEmpty else { scan(dirs); return }
+        stop(); scanID = UUID()  // a cancelled scan still flushes its in-flight jobs; drop them, or tracks come back
+        scanning = false; done = 0; total = 0
+        sources = []; results = []; selection = []; searchKeys = [:]; folder = ""
+        refreshCounts(); resort()
     }
 
     func importPlaylist() {
@@ -135,17 +166,25 @@ enum SortChoice: String, CaseIterable, Identifiable {
 
     func rescan() { if !sources.isEmpty { scan(sources) } }
 
+    /// Replaces the library with the tracks under `urls`.
     func scan(_ urls: [URL]) {
-        stop()
-        let gen = UUID(); scanID = gen  // a cancelled scan still drains its in-flight jobs; drop them, or rows duplicate
         sources = urls
         results = []; selection = []; searchKeys = [:]; folder = ""
-        done = 0; total = 0; started = .now; scanning = true
         refreshCounts(); resort()
+        run(urls)
+    }
+
+    /// Lists the tracks under `urls` and adds the ones not already in `results` as they're analyzed.
+    private func run(_ urls: [URL]) {
+        stop()
+        let gen = UUID(); scanID = gen  // a cancelled scan still drains its in-flight jobs; drop them, or rows duplicate
+        let known = Set(results.map(\.path))
+        done = results.count; total = done; doneBefore = done; started = .now; scanning = true
         let cache = cache
         scanTask = Task {
-            let files = await Task.detached { audioFiles(urls) }.value
-            total = files.count
+            let files = await Task.detached { audioFiles(urls).filter { !known.contains($0.path) } }.value
+            guard scanID == gen else { return }  // superseded while listing
+            total = doneBefore + files.count
             var pending: [TrackResult] = [], last = Date.now
             await withTaskGroup(of: TrackResult?.self) { group in
                 var it = files.makeIterator()
@@ -205,8 +244,9 @@ enum SortChoice: String, CaseIterable, Identifiable {
     }
 
     var eta: String {
-        guard scanning, done > 0, total > done else { return "" }
-        return "ETA \(Int(Date.now.timeIntervalSince(started) / Double(done) * Double(total - done))) s"
+        let n = done - doneBefore  // analyzed by this scan
+        guard scanning, n > 0, total > done else { return "" }
+        return "ETA \(Int(Date.now.timeIntervalSince(started) / Double(n) * Double(total - done))) s"
     }
 
     // MARK: folders & tallies
@@ -349,3 +389,14 @@ enum SortChoice: String, CaseIterable, Identifiable {
 }
 
 private func isDir(_ u: URL) -> Bool { (try? u.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+/// Whether `path` is the source itself or lies inside it.
+private func covers(_ source: URL, _ path: String) -> Bool { path == source.path || path.hasPrefix(source.path + "/") }
+/// The items not inside another item of the list (repeats dropped), so each track is reached once.
+private func outermost(_ urls: [URL]) -> [URL] {
+    var out: [URL] = []
+    for u in urls where !out.contains(where: { covers($0, u.path) }) {
+        out.removeAll { covers(u, $0.path) }
+        out.append(u)
+    }
+    return out
+}
